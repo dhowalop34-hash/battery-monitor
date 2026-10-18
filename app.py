@@ -1,54 +1,21 @@
 from datetime import datetime
-import sqlite3
 import pandas as pd
+from supabase import create_client, Client
 import streamlit as st
 
-DB_NAME = "batteries.db"
+# Настройки подключения к Supabase берутся из секретов Streamlit
+@st.cache_resource
+def init_supabase() -> Client:
+  url = st.secrets["SUPABASE_URL"]
+  key = st.secrets["SUPABASE_KEY"]
+  return create_client(url, key)
 
 
-def init_db():
-  """Инициализация базы данных и первичное заполнение аккумуляторов"""
-  conn = sqlite3.connect(DB_NAME)
-  cursor = conn.cursor()
-
-  cursor.execute("""
-        CREATE TABLE IF NOT EXISTS batteries (
-            id INTEGER PRIMARY KEY,
-            capacity REAL,
-            type TEXT
-        )
-    """)
-
-  cursor.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            battery_id INTEGER,
-            timestamp TEXT,
-            voltage REAL,
-            percentage REAL,
-            FOREIGN KEY (battery_id) REFERENCES batteries (id)
-        )
-    """)
-
-  cursor.execute("SELECT COUNT(*) FROM batteries")
-  if cursor.fetchone()[0] == 0:
-    initial_batteries = [
-        (1, 26.0, "AGM 12V"),
-        (2, 5.0, "AGM 12V"),
-        (3, 5.0, "AGM 12V"),
-        (4, 5.0, "AGM 12V"),
-    ]
-    cursor.executemany(
-        "INSERT INTO batteries (id, capacity, type) VALUES (?, ?, ?)",
-        initial_batteries,
-    )
-    conn.commit()
-
-  conn.close()
+supabase = init_supabase()
 
 
 def agm_voltage_to_percentage(v):
-  """Точный расчет процента заряда для 12V AGM (12.0V ≈ 30%)"""
+  """Точный расчет процента заряда для 12V AGM"""
   if v >= 12.75:
     return 100.0
   if v <= 10.50:
@@ -75,7 +42,7 @@ def agm_voltage_to_percentage(v):
 
 
 def get_status_color(voltage):
-  """Возвращает плашку/иконку статуса по вольтажу"""
+  """Возвращает статус и цвет по вольтажу"""
   if voltage >= 12.5:
     return "🟢 Норма", "green"
   elif voltage >= 12.3:
@@ -86,7 +53,7 @@ def get_status_color(voltage):
     return "⚫ Ниже 12V — Пиздец!", "black"
 
 
-# Настройка ширины страницы
+# Настройка страницы
 st.set_page_config(
     page_title="Мониторинг АКБ",
     page_icon="🔋",
@@ -94,19 +61,21 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-init_db()
-
 st.title("🔋 Мониторинг всех аккумуляторов")
 
-# --- БОКОВАЯ ПАНЕЛЬ (Sidebar) ДЛЯ ВВОДА ЗАМЕРА ---
+# --- ПОЛУЧЕНИЕ СПИСКА АККУМУЛЯТОРОВ ---
+batteries_res = (
+    supabase.table("batteries").select("*").order("id", desc=False).execute()
+)
+batteries_df = pd.DataFrame(batteries_res.data)
+
+# --- БОКОВАЯ ПАНЕЛЬ (Sidebar) ---
 with st.sidebar:
   st.header("📝 Новый замер")
 
-  conn = sqlite3.connect(DB_NAME)
-  batteries_df = pd.read_sql("SELECT * FROM batteries", conn)
-  conn.close()
-
-  battery_ids = batteries_df["id"].tolist()
+  battery_ids = (
+      batteries_df["id"].tolist() if not batteries_df.empty else [1, 2, 3, 4]
+  )
 
   with st.form(key="voltage_form"):
     selected_batt = st.selectbox(
@@ -114,6 +83,8 @@ with st.sidebar:
         battery_ids,
         format_func=lambda x: (
             f"АКБ №{x} ({batteries_df[batteries_df['id'] == x]['capacity'].values[0]} Ah)"
+            if not batteries_df.empty
+            else f"АКБ №{x}"
         ),
     )
     new_voltage = st.number_input(
@@ -132,17 +103,13 @@ with st.sidebar:
       current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
       calc_percentage = agm_voltage_to_percentage(new_voltage)
 
-      conn = sqlite3.connect(DB_NAME)
-      cursor = conn.cursor()
-      cursor.execute(
-          """
-                INSERT INTO history (battery_id, timestamp, voltage, percentage)
-                VALUES (?, ?, ?, ?)
-            """,
-          (selected_batt, current_time, new_voltage, calc_percentage),
-      )
-      conn.commit()
-      conn.close()
+      # Вставка замера в Supabase
+      supabase.table("history").insert({
+          "battery_id": selected_batt,
+          "timestamp": current_time,
+          "voltage": new_voltage,
+          "percentage": calc_percentage,
+      }).execute()
 
       st.success(f"АКБ №{selected_batt} сохранен: {new_voltage}V")
       st.rerun()
@@ -158,31 +125,35 @@ with st.sidebar:
 
 # --- ОСНОВНАЯ ЧАСТЬ: ОБЗОР ВСЕХ АККУМУЛЯТОРОВ ---
 
-conn = sqlite3.connect(DB_NAME)
-query_last = """
-    SELECT b.id, b.capacity, h.voltage, h.percentage, h.timestamp
-    FROM batteries b
-    LEFT JOIN history h ON h.id = (
-        SELECT max(id) FROM history WHERE battery_id = b.id
-    )
-    ORDER BY b.id ASC
-"""
-last_records_df = pd.read_sql(query_last, conn)
-conn.close()
+# Получение последних замеров по всем АКБ
+history_res = (
+    supabase.table("history").select("*").order("id", desc=True).execute()
+)
+history_data = history_res.data
+history_df = pd.DataFrame(history_data)
 
 cols = st.columns(4)
 
-for index, row in last_records_df.iterrows():
+for index, row in batteries_df.iterrows():
   batt_id = int(row["id"])
   capacity = row["capacity"]
-  voltage = row["voltage"]
-  pct = row["percentage"]
-  ts = row["timestamp"]
+
+  # Фильтруем последний замер для данного АКБ
+  batt_history = (
+      history_df[history_df["battery_id"] == batt_id]
+      if not history_df.empty
+      else pd.DataFrame()
+  )
 
   with cols[index]:
     st.subheader(f"🔋 АКБ №{batt_id} ({capacity:.0f} Ah)")
 
-    if pd.notnull(voltage):
+    if not batt_history.empty:
+      last_row = batt_history.iloc[0]
+      voltage = float(last_row["voltage"])
+      pct = float(last_row["percentage"])
+      ts = str(last_row["timestamp"]).replace("T", " ")[:19]
+
       status_text, color = get_status_color(voltage)
 
       if color == "green":
@@ -215,56 +186,30 @@ for index, row in last_records_df.iterrows():
 
 st.divider()
 
-# --- ИСТОРИЯ ЗАМЕРОВ С КОМПАКТНЫМ СТОЛБЦОМ УДАЛЕНИЯ ---
+# --- ИСТОРИЯ ЗАМЕРОВ С ВОЗМОЖНОСТЬЮ УДАЛЕНИЯ ---
 st.subheader("📊 История всех замеров")
 
-conn = sqlite3.connect(DB_NAME)
-all_history_df = pd.read_sql(
-    """
-    SELECT h.id, h.timestamp, h.battery_id, b.capacity, h.voltage, h.percentage
-    FROM history h
-    JOIN batteries b ON h.battery_id = b.id
-    ORDER BY h.id DESC
-""",
-    conn,
-)
-conn.close()
+if not history_df.empty:
+  display_df = history_df.copy()
 
-if not all_history_df.empty:
-  display_df = all_history_df.copy()
-  display_df["battery_name"] = display_df.apply(
-      lambda r: f"АКБ №{int(r['battery_id'])} ({r['capacity']:.0f} Ah)", axis=1
+  # Приводим названия аккумуляторов
+  display_df["battery_name"] = display_df["battery_id"].apply(
+      lambda bid: (
+          f"АКБ №{bid} ({batteries_df[batteries_df['id'] == bid]['capacity'].values[0]:.0f} Ah)"
+          if not batteries_df[batteries_df["id"] == bid].empty
+          else f"АКБ №{bid}"
+      )
   )
 
-  display_df["❌"] = False
-
-  cols_order = ["❌", "timestamp", "battery_name", "voltage", "percentage"]
+  display_df[""] = False
+  cols_order = ["", "timestamp", "battery_name", "voltage", "percentage"]
   display_df = display_df[cols_order]
-
-  # Точный CSS-стиль для сжатия первой колонки таблицы
-  st.markdown(
-      """
-        <style>
-        div[data-testid="stDataFrame"] div[data-baseweb="table"] th:nth-child(1),
-        div[data-testid="stDataFrame"] div[data-baseweb="table"] td:nth-child(1) {
-            width: 55px !important;
-            min-width: 55px !important;
-            max-width: 55px !important;
-            text-align: center !important;
-        }
-        </style>
-    """,
-      unsafe_allow_html=True,
-  )
 
   edited_df = st.data_editor(
       display_df,
       column_config={
-          "❌": st.column_config.CheckboxColumn(
-              "❌УДАЛЕНИЯ",
-              help="Поставьте галочку для удаления",
-              default=False,
-              width="small",
+          "": st.column_config.CheckboxColumn(
+              "", help="Выбрать для удаления", default=False, width="small"
           ),
           "timestamp": st.column_config.TextColumn(
               "Дата и время", disabled=True
@@ -284,25 +229,20 @@ if not all_history_df.empty:
       key="history_editor",
   )
 
-  selected_rows = edited_df[edited_df["❌"] == True]
+  selected_rows = edited_df[edited_df[""] == True]
 
   if not selected_rows.empty:
     selected_indices = selected_rows.index
-    selected_ids = all_history_df.loc[selected_indices, "id"].tolist()
+    selected_ids = history_df.loc[selected_indices, "id"].tolist()
 
     if st.button(
         f"🗑️ Подтвердить удаление выбранных записей ({len(selected_ids)} шт.)",
         type="primary",
     ):
-      conn = sqlite3.connect(DB_NAME)
-      cursor = conn.cursor()
       for target_id in selected_ids:
-        cursor.execute("DELETE FROM history WHERE id = ?", (target_id,))
-      conn.commit()
-      conn.close()
+        supabase.table("history").delete().eq("id", target_id).execute()
 
       st.toast("❌ Запись(и) успешно удалены!", icon="🗑️")
       st.rerun()
-
 else:
   st.info("История замеров пуста.")
