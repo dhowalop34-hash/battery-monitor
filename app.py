@@ -3,19 +3,16 @@ import pandas as pd
 from supabase import create_client, Client
 import streamlit as st
 
-# Настройки подключения к Supabase берутся из секретов Streamlit
+# Настройка подключения к Supabase
 @st.cache_resource
 def init_supabase() -> Client:
   url = st.secrets["SUPABASE_URL"]
   key = st.secrets["SUPABASE_KEY"]
   return create_client(url, key)
 
-
 supabase = init_supabase()
 
-
 def agm_voltage_to_percentage(v):
-  """Точный расчет процента заряда для 12V AGM"""
   if v >= 12.75:
     return 100.0
   if v <= 10.50:
@@ -40,9 +37,7 @@ def agm_voltage_to_percentage(v):
 
   return 0.0
 
-
 def get_status_color(voltage):
-  """Возвращает статус и цвет по вольтажу"""
   if voltage >= 12.5:
     return "🟢 Норма", "green"
   elif voltage >= 12.3:
@@ -52,8 +47,6 @@ def get_status_color(voltage):
   else:
     return "⚫ Ниже 12V — Пиздец!", "black"
 
-
-# Настройка страницы
 st.set_page_config(
     page_title="Мониторинг АКБ",
     page_icon="🔋",
@@ -63,19 +56,18 @@ st.set_page_config(
 
 st.title("🔋 Мониторинг всех аккумуляторов")
 
-# --- ПОЛУЧЕНИЕ СПИСКА АККУМУЛЯТОРОВ ---
-batteries_res = (
-    supabase.table("batteries").select("*").order("id", desc=False).execute()
-)
-batteries_df = pd.DataFrame(batteries_res.data)
+# Получение списка аккумуляторов
+try:
+  batteries_res = supabase.table("batteries").select("*").order("id", desc=False).execute()
+  batteries_df = pd.DataFrame(batteries_res.data)
+except Exception as e:
+  batteries_df = pd.DataFrame(columns=["id", "capacity", "type"])
 
-# --- БОКОВАЯ ПАНЕЛЬ (Sidebar) ---
+# Боковая панель
 with st.sidebar:
   st.header("📝 Новый замер")
 
-  battery_ids = (
-      batteries_df["id"].tolist() if not batteries_df.empty else [1, 2, 3, 4]
-  )
+  battery_ids = batteries_df["id"].tolist() if not batteries_df.empty else [1, 2, 3, 4]
 
   with st.form(key="voltage_form"):
     selected_batt = st.selectbox(
@@ -83,7 +75,7 @@ with st.sidebar:
         battery_ids,
         format_func=lambda x: (
             f"АКБ №{x} ({batteries_df[batteries_df['id'] == x]['capacity'].values[0]} Ah)"
-            if not batteries_df.empty
+            if not batteries_df.empty and x in batteries_df['id'].values
             else f"АКБ №{x}"
         ),
     )
@@ -103,7 +95,6 @@ with st.sidebar:
       current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
       calc_percentage = agm_voltage_to_percentage(new_voltage)
 
-      # Вставка замера в Supabase
       supabase.table("history").insert({
           "battery_id": selected_batt,
           "timestamp": current_time,
@@ -123,13 +114,13 @@ with st.sidebar:
         * **< 12.0V**: ⚫ Пиздец
         """)
 
-# --- ОСНОВНАЯ ЧАСТЬ: ОБЗОР ВСЕХ АККУМУЛЯТОРОВ ---
+# Получение истории (безопасный запрос, если таблица пустая)
+try:
+  history_res = supabase.table("history").select("*").order("id", desc=True).execute()
+  history_data = history_res.data if history_res and history_res.data else []
+except Exception:
+  history_data = []
 
-# Получение последних замеров по всем АКБ
-history_res = (
-    supabase.table("history").select("*").order("id", desc=True).execute()
-)
-history_data = history_res.data
 history_df = pd.DataFrame(history_data)
 
 cols = st.columns(4)
@@ -138,14 +129,15 @@ for index, row in batteries_df.iterrows():
   batt_id = int(row["id"])
   capacity = row["capacity"]
 
-  # Фильтруем последний замер для данного АКБ
   batt_history = (
       history_df[history_df["battery_id"] == batt_id]
-      if not history_df.empty
+      if not history_df.empty and "battery_id" in history_df.columns
       else pd.DataFrame()
   )
 
-  with cols[index]:
+  # Корректируем индекс для колонок, если АКБ больше чем колонок
+  col_idx = index % len(cols)
+  with cols[col_idx]:
     st.subheader(f"🔋 АКБ №{batt_id} ({capacity:.0f} Ah)")
 
     if not batt_history.empty:
@@ -163,10 +155,7 @@ for index, row in batteries_df.iterrows():
       elif color == "red":
         border_css = "border-left: 5px solid #dc3545; background-color: #fff0f0;"
       else:
-        border_css = (
-            "border-left: 5px solid #000000; background-color: #222222;"
-            " color: #ffffff;"
-        )
+        border_css = "border-left: 5px solid #000000; background-color: #222222; color: #ffffff;"
 
       text_color = "#ffffff" if color == "black" else "#000000"
 
@@ -186,13 +175,11 @@ for index, row in batteries_df.iterrows():
 
 st.divider()
 
-# --- ИСТОРИЯ ЗАМЕРОВ С ВОЗМОЖНОСТЬЮ УДАЛЕНИЯ ---
 st.subheader("📊 История всех замеров")
 
-if not history_df.empty:
+if not history_df.empty and "id" in history_df.columns:
   display_df = history_df.copy()
 
-  # Приводим названия аккумуляторов
   display_df["battery_name"] = display_df["battery_id"].apply(
       lambda bid: (
           f"АКБ №{bid} ({batteries_df[batteries_df['id'] == bid]['capacity'].values[0]:.0f} Ah)"
@@ -203,7 +190,7 @@ if not history_df.empty:
 
   display_df[""] = False
   cols_order = ["", "timestamp", "battery_name", "voltage", "percentage"]
-  display_df = display_df[cols_order]
+  display_df = display_df[[c for c in cols_order if c in display_df.columns]]
 
   edited_df = st.data_editor(
       display_df,
@@ -211,18 +198,10 @@ if not history_df.empty:
           "": st.column_config.CheckboxColumn(
               "", help="Выбрать для удаления", default=False, width="small"
           ),
-          "timestamp": st.column_config.TextColumn(
-              "Дата и время", disabled=True
-          ),
-          "battery_name": st.column_config.TextColumn(
-              "Аккумулятор", disabled=True
-          ),
-          "voltage": st.column_config.NumberColumn(
-              "Вольтаж (V)", disabled=True, format="%.2f V"
-          ),
-          "percentage": st.column_config.NumberColumn(
-              "Заряд (%)", disabled=True, format="%.1f%%"
-          ),
+          "timestamp": st.column_config.TextColumn("Дата и время", disabled=True),
+          "battery_name": st.column_config.TextColumn("Аккумулятор", disabled=True),
+          "voltage": st.column_config.NumberColumn("Вольтаж (V)", disabled=True, format="%.2f V"),
+          "percentage": st.column_config.NumberColumn("Заряд (%)", disabled=True, format="%.1f%%"),
       },
       hide_index=True,
       use_container_width=True,
@@ -235,14 +214,11 @@ if not history_df.empty:
     selected_indices = selected_rows.index
     selected_ids = history_df.loc[selected_indices, "id"].tolist()
 
-    if st.button(
-        f"🗑️ Подтвердить удаление выбранных записей ({len(selected_ids)} шт.)",
-        type="primary",
-    ):
+    if st.button(f"🗑️ Подтвердить удаление выбранных записей ({len(selected_ids)} шт.)", type="primary"):
       for target_id in selected_ids:
         supabase.table("history").delete().eq("id", target_id).execute()
 
       st.toast("❌ Запись(и) успешно удалены!", icon="🗑️")
       st.rerun()
 else:
-  st.info("История замеров пуста.")
+  st.info("История замеров пуста. Сделайте первый замер в боковой панели слева!")
